@@ -52,7 +52,7 @@ from .normal_math import vector_normal_z_node
 
 _LOG = get_logger(__name__)
 
-_ML_CACHE_VERSION = 5
+_ML_CACHE_VERSION = 6
 
 LAYER_BUNDLE_ITEMS = (
     ("RGBA", "Color"),
@@ -60,6 +60,14 @@ LAYER_BUNDLE_ITEMS = (
     ("FLOAT", "Roughness"),
     ("VECTOR", "Normal"),
     ("VECTOR", "Microblend"),
+    ("FLOAT", "Layer Mask"),
+)
+# Cycles runs out of SVM stack on big multilayer materials (worse with the texture cache on). Anything shared between
+# colour, metal/rough and normal stays on the stack for every layer, so we keep those three paths apart.
+_BLEND_BUNDLE_ITEMS = (
+    ("RGBA", "Color"),
+    ("VECTOR", "Metal Rough"),
+    ("VECTOR", "Normal"),
     ("FLOAT", "Layer Mask"),
 )
 _SURFACE_BUNDLE_ITEMS = (
@@ -898,7 +906,7 @@ def safe_layer_group_name(
 
 
 def mask_mixer_node_group():
-    ng_name = "Mask Mixer 2.0.0"
+    ng_name = "Mask Mixer 2.1.0"
     existing = bpy.data.node_groups.get(ng_name)
     if existing:
         return existing
@@ -1092,7 +1100,28 @@ def mask_mixer_node_group():
         mbNormalVectorize.outputs["Vector"], mbNormalStr.inputs["Vector"]
     )
     mask_mixer.links.new(mbNormalStr.outputs["Vector"], result.inputs["Microblend"])
-    mask_mixer.links.new(maskMultiply.outputs["Value"], result.inputs["Layer Mask"])
+
+    # Send the mask out through the microblend vector so Cycles can't compute it early and hold the sample on the stack.
+    maskLift = create_node(mask_mixer.nodes, "ShaderNodeCombineXYZ", (560, -520))
+    maskLift.label = "Layer Mask as Z"
+    maskJoin = shader_nodes.vector_math(
+        mask_mixer.nodes,
+        mask_mixer.links,
+        "ADD",
+        label="Microblend XY + Layer Mask Z",
+        location=(760, -450),
+        hide=True,
+    ).node
+    maskSplit = create_node(mask_mixer.nodes, "ShaderNodeSeparateXYZ", (880, -520))
+    maskSplit.label = "Layer Mask"
+    mask_mixer.links.new(maskMultiply.outputs["Value"], maskLift.inputs["Z"])
+    mask_mixer.links.new(mbNormalStr.outputs["Vector"], maskJoin.inputs["Vector"])
+    mask_mixer.links.new(
+        maskLift.outputs["Vector"],
+        shader_nodes.socket_by_identifier(maskJoin.inputs, "Vector_001"),
+    )
+    mask_mixer.links.new(maskJoin.outputs["Vector"], maskSplit.inputs["Vector"])
+    mask_mixer.links.new(maskSplit.outputs["Z"], result.inputs["Layer Mask"])
 
     return mask_mixer
 
@@ -1218,8 +1247,70 @@ def layer_levels_node_group():
     return group
 
 
+def _layer_pack_node_group():
+    ng_name = "CP77 Multilayer Layer Pack 1.0.0"
+    existing = bpy.data.node_groups.get(ng_name)
+    if existing:
+        return existing
+
+    NG = new_tracked_datablock("node_groups", ng_name, "ShaderNodeTree")
+    NG.interface.new_socket(
+        name="Layer", socket_type="NodeSocketBundle", in_out="INPUT"
+    )
+    NG.interface.new_socket(
+        name="Layer", socket_type="NodeSocketBundle", in_out="OUTPUT"
+    )
+
+    GroupInN = create_node(NG.nodes, "NodeGroupInput", (-700, 0))
+    GroupInN.hide = False
+    GroupOutN = create_node(NG.nodes, "NodeGroupOutput", (300, 0), hide=False)
+
+    layer = separate_bundle_node(
+        NG,
+        LAYER_BUNDLE_ITEMS,
+        (-500, 0),
+        name="CP77 Layer Unpack",
+        label="Layer",
+    )
+    packed = combine_bundle_node(
+        NG,
+        _BLEND_BUNDLE_ITEMS,
+        (80, 0),
+        name="CP77 Packed Layer Pack",
+        label="Packed Layer",
+    )
+    NG.links.new(GroupInN.outputs["Layer"], layer.inputs["Bundle"])
+    NG.links.new(packed.outputs["Bundle"], GroupOutN.inputs["Layer"])
+
+    MetalRoughN = create_node(NG.nodes, "ShaderNodeCombineXYZ", (-200, -40))
+    MetalRoughN.label = "Metalness, Roughness"
+    NG.links.new(layer.outputs["Metalness"], MetalRoughN.inputs["X"])
+    NG.links.new(layer.outputs["Roughness"], MetalRoughN.inputs["Y"])
+
+    # Same mask for both, so they can be blended as one sum.
+    NormalN = shader_nodes.vector_math(
+        NG.nodes,
+        NG.links,
+        "ADD",
+        label="Normal + Microblend",
+        location=(-200, -140),
+        hide=True,
+    ).node
+    NG.links.new(layer.outputs["Normal"], NormalN.inputs["Vector"])
+    NG.links.new(
+        layer.outputs["Microblend"],
+        shader_nodes.socket_by_identifier(NormalN.inputs, "Vector_001"),
+    )
+
+    NG.links.new(layer.outputs["Color"], packed.inputs["Color"])
+    NG.links.new(MetalRoughN.outputs["Vector"], packed.inputs["Metal Rough"])
+    NG.links.new(NormalN.outputs["Vector"], packed.inputs["Normal"])
+    NG.links.new(layer.outputs["Layer Mask"], packed.inputs["Layer Mask"])
+    return NG
+
+
 def _getOrCreateLayerBlend5():
-    ng_name = "Layer Blend 2.0.0"
+    ng_name = "Layer Blend 3.0.0"
     existing = bpy.data.node_groups.get(ng_name)
     if existing:
         return existing
@@ -1235,33 +1326,38 @@ def _getOrCreateLayerBlend5():
         name="Layer", socket_type="NodeSocketBundle", in_out="OUTPUT"
     )
 
-    GroupInN = create_node(NG.nodes, "NodeGroupInput", (-900, 0))
+    GroupInN = create_node(NG.nodes, "NodeGroupInput", (-1100, 0))
     GroupInN.hide = False
     GroupOutN = create_node(NG.nodes, "NodeGroupOutput", (100, 0), hide=False)
 
+    # A is already packed, B comes straight from a layer group.
+    pack_b = create_node(NG.nodes, "ShaderNodeGroup", (-900, -220), hide=False)
+    pack_b.label = "Pack Layer B"
+    pack_b.node_tree = _layer_pack_node_group()
     layer_a = separate_bundle_node(
         NG,
-        LAYER_BUNDLE_ITEMS,
+        _BLEND_BUNDLE_ITEMS,
         (-700, 120),
         name="CP77 Layer A Unpack",
         label="Layer A",
     )
     layer_b = separate_bundle_node(
         NG,
-        LAYER_BUNDLE_ITEMS,
+        _BLEND_BUNDLE_ITEMS,
         (-700, -220),
         name="CP77 Layer B Unpack",
         label="Layer B",
     )
     blended = combine_bundle_node(
         NG,
-        LAYER_BUNDLE_ITEMS,
+        _BLEND_BUNDLE_ITEMS,
         (-160, 40),
         name="CP77 Blended Layer Pack",
         label="Blended Layer",
     )
     NG.links.new(GroupInN.outputs["Layer A"], layer_a.inputs["Bundle"])
-    NG.links.new(GroupInN.outputs["Layer B"], layer_b.inputs["Bundle"])
+    NG.links.new(GroupInN.outputs["Layer B"], pack_b.inputs["Layer"])
+    NG.links.new(pack_b.outputs["Layer"], layer_b.inputs["Bundle"])
     NG.links.new(blended.outputs["Bundle"], GroupOutN.inputs["Layer"])
 
     blend_mask = create_node(NG.nodes, "NodeReroute", (-500, -380))
@@ -1270,60 +1366,39 @@ def _getOrCreateLayerBlend5():
 
     ColorMixN = create_node(NG.nodes, "ShaderNodeMix", (-380, 160), label="Color")
     ColorMixN.data_type = "RGBA"
-    MetalMixN = create_node(NG.nodes, "ShaderNodeMix", (-380, 60), label="Metalness")
-    MetalMixN.data_type = "FLOAT"
-    RoughMixN = create_node(NG.nodes, "ShaderNodeMix", (-380, -40), label="Roughness")
-    RoughMixN.data_type = "FLOAT"
+    MetalRoughMixN = create_node(
+        NG.nodes, "ShaderNodeMix", (-380, 10), label="Metalness, Roughness"
+    )
+    MetalRoughMixN.data_type = "VECTOR"
     NormalMixN = create_node(NG.nodes, "ShaderNodeMix", (-380, -140), label="Normal")
     NormalMixN.data_type = "VECTOR"
     NormalMixN.clamp_factor = False
-    MicroblendMixN = create_node(
-        NG.nodes, "ShaderNodeMix", (-380, -240), label="Microblend"
-    )
-    MicroblendMixN.data_type = "VECTOR"
-    MicroblendMixN.clamp_factor = False
 
     NG.links.new(
         layer_a.outputs["Color"],
         shader_nodes.socket_by_identifier(ColorMixN.inputs, "A_Color"),
     )
     NG.links.new(
-        layer_a.outputs["Metalness"],
-        shader_nodes.socket_by_identifier(MetalMixN.inputs, "A_Float"),
-    )
-    NG.links.new(
-        layer_a.outputs["Roughness"],
-        shader_nodes.socket_by_identifier(RoughMixN.inputs, "A_Float"),
+        layer_a.outputs["Metal Rough"],
+        shader_nodes.socket_by_identifier(MetalRoughMixN.inputs, "A_Vector"),
     )
     NG.links.new(
         layer_a.outputs["Normal"],
         shader_nodes.socket_by_identifier(NormalMixN.inputs, "A_Vector"),
     )
     NG.links.new(
-        layer_a.outputs["Microblend"],
-        shader_nodes.socket_by_identifier(MicroblendMixN.inputs, "A_Vector"),
-    )
-    NG.links.new(
         layer_b.outputs["Color"],
         shader_nodes.socket_by_identifier(ColorMixN.inputs, "B_Color"),
     )
     NG.links.new(
-        layer_b.outputs["Metalness"],
-        shader_nodes.socket_by_identifier(MetalMixN.inputs, "B_Float"),
-    )
-    NG.links.new(
-        layer_b.outputs["Roughness"],
-        shader_nodes.socket_by_identifier(RoughMixN.inputs, "B_Float"),
+        layer_b.outputs["Metal Rough"],
+        shader_nodes.socket_by_identifier(MetalRoughMixN.inputs, "B_Vector"),
     )
     NG.links.new(
         layer_b.outputs["Normal"],
         shader_nodes.socket_by_identifier(NormalMixN.inputs, "B_Vector"),
     )
-    NG.links.new(
-        layer_b.outputs["Microblend"],
-        shader_nodes.socket_by_identifier(MicroblendMixN.inputs, "B_Vector"),
-    )
-    for node in (ColorMixN, MetalMixN, RoughMixN, NormalMixN, MicroblendMixN):
+    for node in (ColorMixN, MetalRoughMixN, NormalMixN):
         NG.links.new(blend_mask.outputs["Output"], node.inputs["Factor"])
 
     NG.links.new(
@@ -1331,20 +1406,12 @@ def _getOrCreateLayerBlend5():
         blended.inputs["Color"],
     )
     NG.links.new(
-        shader_nodes.socket_by_identifier(MetalMixN.outputs, "Result_Float"),
-        blended.inputs["Metalness"],
-    )
-    NG.links.new(
-        shader_nodes.socket_by_identifier(RoughMixN.outputs, "Result_Float"),
-        blended.inputs["Roughness"],
+        shader_nodes.socket_by_identifier(MetalRoughMixN.outputs, "Result_Vector"),
+        blended.inputs["Metal Rough"],
     )
     NG.links.new(
         shader_nodes.socket_by_identifier(NormalMixN.outputs, "Result_Vector"),
         blended.inputs["Normal"],
-    )
-    NG.links.new(
-        shader_nodes.socket_by_identifier(MicroblendMixN.outputs, "Result_Vector"),
-        blended.inputs["Microblend"],
     )
     NG.links.new(layer_b.outputs["Layer Mask"], blended.inputs["Layer Mask"])
     return NG
@@ -1352,7 +1419,7 @@ def _getOrCreateLayerBlend5():
 
 # Build the canonical multilayer surface data without terminating in a BSDF.
 def ml_surface_node_group():
-    ng_name = "Multilayer Surface 3.0.0"
+    ng_name = "Multilayer Surface 3.1.0"
     existing = bpy.data.node_groups.get(ng_name)
     if existing:
         return existing
@@ -1389,9 +1456,6 @@ def ml_surface_node_group():
         normal_vectorize.inputs, "Vector_002"
     ).default_value = (-1, -1, 0)
 
-    normal_microblend_add = shader_nodes.vector_math(
-        surface.nodes, surface.links, "ADD", location=(-700, -75), hide=True
-    ).node
     normal_add = shader_nodes.vector_math(
         surface.nodes, surface.links, "ADD", location=(-700, 0), hide=True
     ).node
@@ -1400,6 +1464,12 @@ def ml_surface_node_group():
         create_node(surface.nodes, "ShaderNodeNormalMap", (-500, -300))
     )
 
+    base_pack = surface.nodes.new("ShaderNodeGroup")
+    base_pack.name = "Layer_Pack_1"
+    base_pack.location = (-1050, -150)
+    base_pack.node_tree = _layer_pack_node_group()
+    surface.links.new(group_input.outputs["Layer 1"], base_pack.inputs["Layer"])
+
     blend_group = _getOrCreateLayerBlend5()
     for count in range(1, 20):
         blend = surface.nodes.new("ShaderNodeGroup")
@@ -1407,20 +1477,20 @@ def ml_surface_node_group():
         blend.location = (-900, -150 * count)
         blend.node_tree = blend_group
         if count == 1:
-            surface.links.new(
-                group_input.outputs[f"Layer {count}"], blend.inputs["Layer A"]
-            )
+            surface.links.new(base_pack.outputs["Layer"], blend.inputs["Layer A"])
         surface.links.new(
             group_input.outputs[f"Layer {count + 1}"], blend.inputs["Layer B"]
         )
 
     separate = separate_bundle_node(
         surface,
-        LAYER_BUNDLE_ITEMS,
+        _BLEND_BUNDLE_ITEMS,
         (-700, -150),
         name="CP77 Final Layer Unpack",
         label="Final Layer",
     )
+    metal_rough = create_node(surface.nodes, "ShaderNodeSeparateXYZ", (-450, -150))
+    metal_rough.label = "Metalness, Roughness"
 
     surface.links.new(
         group_input.outputs["Normal Map"], normal_vectorize.inputs["Vector"]
@@ -1434,16 +1504,10 @@ def ml_surface_node_group():
         surface.nodes["Layer_Blend_19"].outputs["Layer"], separate.inputs["Bundle"]
     )
 
-    surface.links.new(
-        separate.outputs["Normal"], normal_microblend_add.inputs["Vector"]
-    )
-    surface.links.new(
-        separate.outputs["Microblend"],
-        shader_nodes.socket_by_identifier(normal_microblend_add.inputs, "Vector_001"),
-    )
+    surface.links.new(separate.outputs["Metal Rough"], metal_rough.inputs["Vector"])
     surface.links.new(normal_vectorize.outputs["Vector"], normal_add.inputs["Vector"])
     surface.links.new(
-        normal_microblend_add.outputs["Vector"],
+        separate.outputs["Normal"],
         shader_nodes.socket_by_identifier(normal_add.inputs, "Vector_001"),
     )
     surface.links.new(normal_add.outputs["Vector"], normal_rebuild.inputs["Image"])
@@ -1457,8 +1521,8 @@ def ml_surface_node_group():
         label="Surface Channels",
     )
     surface.links.new(separate.outputs["Color"], surface_bundle.inputs["Base Color"])
-    surface.links.new(separate.outputs["Metalness"], surface_bundle.inputs["Metallic"])
-    surface.links.new(separate.outputs["Roughness"], surface_bundle.inputs["Roughness"])
+    surface.links.new(metal_rough.outputs["X"], surface_bundle.inputs["Metallic"])
+    surface.links.new(metal_rough.outputs["Y"], surface_bundle.inputs["Roughness"])
     surface.links.new(normal_map.outputs["Normal"], surface_bundle.inputs["Normal"])
     surface.links.new(surface_bundle.outputs["Bundle"], group_output.inputs["Surface"])
 
@@ -1581,6 +1645,19 @@ class Multilayered(MaterialTypeBase):
         ).node
         MapN = create_node(NG.nodes, "ShaderNodeMapping", (-350, -50))
 
+        # Each channel gets its own UV transform. They're written three different ways on purpose, otherwise Cycles
+        # merges them back into one.
+        SurfaceUVN = create_node(NG.nodes, "ShaderNodeUVMap", (-900, -250))
+        SurfaceMapN = create_node(NG.nodes, "ShaderNodeMapping", (-350, -250))
+        NormalMapN = shader_nodes.vector_math(
+            NG.nodes,
+            NG.links,
+            "MULTIPLY_ADD",
+            label="Normal UV",
+            location=(-350, -450),
+            hide=True,
+        ).node
+
         TileMultN = create_node(NG.nodes, "ShaderNodeValue", (-650, 50))
         TileMultN["cp77_multilayer_template_role"] = "tile_multiplier"
         TileMultN.label = "Tile Multiplier"
@@ -1664,9 +1741,16 @@ class Multilayered(MaterialTypeBase):
         NG.links.new(TexCordN.outputs["UV"], MapN.inputs["Vector"])
         NG.links.new(VecMathN.outputs["Vector"], MapN.inputs["Scale"])
         NG.links.new(MapN.outputs["Vector"], CTN.inputs["Vector"])
-        NG.links.new(MapN.outputs["Vector"], NTN.inputs["Vector"])
-        NG.links.new(MapN.outputs["Vector"], RTN.inputs["Vector"])
-        NG.links.new(MapN.outputs["Vector"], MTN.inputs["Vector"])
+        NG.links.new(SurfaceUVN.outputs["UV"], SurfaceMapN.inputs["Vector"])
+        NG.links.new(VecMathN.outputs["Vector"], SurfaceMapN.inputs["Scale"])
+        NG.links.new(SurfaceMapN.outputs["Vector"], RTN.inputs["Vector"])
+        NG.links.new(SurfaceMapN.outputs["Vector"], MTN.inputs["Vector"])
+        NG.links.new(TexCordN.outputs["UV"], NormalMapN.inputs["Vector"])
+        NG.links.new(
+            VecMathN.outputs["Vector"],
+            shader_nodes.socket_by_identifier(NormalMapN.inputs, "Vector_001"),
+        )
+        NG.links.new(NormalMapN.outputs["Vector"], NTN.inputs["Vector"])
         NG.links.new(TileMultN.outputs["Value"], VecMathN.inputs["Vector"])
         NG.links.new(
             ColorRampOut.outputs["Color"],
@@ -1686,6 +1770,11 @@ class Multilayered(MaterialTypeBase):
         )
         NG.links.new(normalMultiply.outputs["Vector"], sample.inputs["Normal"])
         NG.links.new(combineOffUV.outputs["Vector"], MapN.inputs["Location"])
+        NG.links.new(combineOffUV.outputs["Vector"], SurfaceMapN.inputs["Location"])
+        NG.links.new(
+            combineOffUV.outputs["Vector"],
+            shader_nodes.socket_by_identifier(NormalMapN.inputs, "Vector_002"),
+        )
         NG.links.new(sample.outputs["Bundle"], GroupOutN.inputs["Sample"])
 
         _register_template_blueprint(NG)
@@ -2539,7 +2628,7 @@ class Multilayered(MaterialTypeBase):
         ml_surface = ml_surface_node_group()
         ml_surface.color_tag = "SHADER"
         ml_root = CurMat.nodes.new("ShaderNodeGroup")
-        ml_root.name = "Multilayer Surface 3.0.0"
+        ml_root.name = "Multilayer Surface 3.1.0"
         ml_root["cp77_material_tools_role"] = "multilayer_root"
         ml_root.location = (-120, 120)
         ml_root.node_tree = ml_surface
